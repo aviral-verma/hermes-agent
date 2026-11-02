@@ -221,6 +221,26 @@ class TestClassifier:
         fills = select_password_fill([pw1, pw2], "p")
         assert len(fills) == 1 and fills[0]["index"] == 1
 
+    def test_select_password_fill_keeps_the_inspected_frame_path(self):
+        control = LoginControl.from_dict({
+            "autocomplete": "current-password",
+            "index": 4,
+            "type": "password",
+            "framePath": [2, 5],
+        })
+
+        fills = select_password_fill(
+            [ClassifiedLoginControl(control, 100, "current-password")],
+            "dummy-password",
+        )
+
+        assert fills == [{
+            "index": 4,
+            "token": "current-password",
+            "value": "dummy-password",
+            "frame_path": (2, 5),
+        }]
+
 
     def test_build_fill_js_leaves_no_dom_marker_and_binds_target_to_inspection(self):
         # P1-1: no persistent selector for filled controls. The fill targets the input by the
@@ -296,6 +316,30 @@ class TestBrowserVaultTools:
         assert out["success"] is False
         assert out["error_type"] == "origin_mismatch"
         assert "s3cret-pw" not in json.dumps(out)
+
+    def test_failed_inspection_still_cleans_its_partial_markers(self):
+        from tools import browser_vault_tool
+
+        evaluated = []
+
+        def fake_eval(task_id, expression):
+            evaluated.append(expression)
+            if len(evaluated) == 1:
+                return {"success": False, "error": "dummy inspection failure"}
+            return {"success": True, "result": json.dumps({"cleaned": 1})}
+
+        with patch.object(browser_vault_tool, "_eval_js", side_effect=fake_eval):
+            out = json.loads(browser_vault_tool._fill_bound_page(
+                backend=None,
+                handle="dummy",
+                meta=None,
+                page_origin="https://dummy.test",
+                effective_task_id="unit",
+            ))
+
+        assert out["success"] is False
+        assert out["error"] == "Could not inspect page inputs: dummy inspection failure"
+        assert len(evaluated) == 2  # failed inspection, then cleanup of any stamps it wrote first
 
     @staticmethod
     def _manager_meta():
@@ -399,7 +443,7 @@ class TestBrowserVaultTools:
         ]
 
         def fake_eval(task_id, expression):
-            if "location.href" in expression:
+            if expression == "window.location.href":
                 return {"success": True, "result": "https://example.com/login"}
             return {"success": True, "result": json.dumps(controls)}
 
@@ -443,7 +487,7 @@ class TestBrowserVaultTools:
         ]
 
         def fake_eval(task_id, expression):
-            if "location.href" in expression:
+            if expression == "window.location.href":
                 # Pre-check sees the allowed origin.
                 return {"success": True, "result": "https://example.com/login"}
             return {"success": True, "result": json.dumps(controls)}
@@ -481,7 +525,7 @@ class TestBrowserVaultTools:
         ]
 
         def fake_eval(task_id, expression):
-            if "location.href" in expression:
+            if expression == "window.location.href":
                 return {"success": True, "result": "https://example.com/login"}
             return {"success": True, "result": json.dumps(controls)}
 
@@ -491,6 +535,7 @@ class TestBrowserVaultTools:
         with patch("agent.vault_store.get_vault_store", return_value=store), \
              patch.object(browser_vault_tool, "_eval_js", side_effect=fake_eval), \
              patch("tools.browser_session.session_for_task", return_value={}), \
+             patch("tools.browser_use_cli._default_browser_exec_cdp", return_value=""), \
              patch("tools.browser_supervisor.SUPERVISOR_REGISTRY") as reg:
             reg.get.return_value = None
             raw = browser_vault_tool.browser_vault_fill(meta.id)
@@ -516,7 +561,7 @@ class TestBrowserVaultTools:
         ]
 
         def fake_eval(task_id, expression):
-            if "location.href" in expression:
+            if expression == "window.location.href":
                 return {"success": True, "result": "https://example.com/login"}
             return {"success": True, "result": json.dumps(controls)}
 
@@ -562,7 +607,7 @@ class TestBrowserVaultTools:
         ]
 
         def fake_eval(task_id, expression):
-            if "location.href" in expression:
+            if expression == "window.location.href":
                 return {"success": True, "result": "https://shop.test/checkout"}
             return {"success": True, "result": json.dumps(controls)}
 
@@ -809,13 +854,17 @@ class TestTwoFactor:
         get a digit sprayed across them. Only an unmistakable maxlength=1 same-form adjacent group splits."""
         from agent.vault_login_classifier import ClassifiedLoginControl, LoginControl, build_otp_fills
 
-        def ctl(i, form=0, maxlen=None, score=70):
-            return ClassifiedLoginControl(LoginControl("", form, i, "", f"code{i}", "text", maxlen), score, "one-time-code")
+        def ctl(i, form=0, maxlen=None, score=70, frame=()):
+            control = LoginControl("", form, i, "", f"code{i}", "text", maxlen, frame)
+            return ClassifiedLoginControl(control, score, "one-time-code")
 
         scattered = [ctl(0), ctl(3), ctl(7), ctl(9, form=1), ctl(12, score=100)]
         assert build_otp_fills(scattered, "246810") == [{"index": 12, "token": "one-time-code", "value": "246810"}]
-        # maxlength=1 but different forms / non-adjacent: still one field
+        # maxlength=1 but different forms / frames / non-adjacent: still one field
         assert len(build_otp_fills([ctl(i, form=i % 2, maxlen=1) for i in range(6)], "246810")) == 1
+        assert len(build_otp_fills([
+            ctl(i, maxlen=1, frame=() if i < 3 else (0,)) for i in range(6)
+        ], "246810")) == 1
         assert len(build_otp_fills([ctl(i * 2, maxlen=1) for i in range(6)], "246810")) == 1
         # five boxes for a six-digit code: one field
         assert len(build_otp_fills([ctl(i, maxlen=1) for i in range(5)], "246810")) == 1
@@ -825,8 +874,16 @@ class TestTwoFactor:
     def test_no_code_field_points_at_passkey_or_device_approval(self):
         from tools import browser_vault_tool
 
-        fake_eval = lambda t, e: {"success": True, "result": json.dumps([{"index": 0, "type": "text", "name": "q", "label": "Search", "autocomplete": ""}]) if "querySelectorAll" in e else "https://acme.test/approve"}
+        evaluated = []
+
+        def fake_eval(task_id, expression):
+            evaluated.append(expression)
+            result = ([{"index": 0, "type": "text", "name": "q", "label": "Search",
+                        "autocomplete": ""}] if len(evaluated) == 2 else "https://acme.test/approve")
+            return {"success": True, "result": json.dumps(result) if isinstance(result, list) else result}
+
         with patch.object(browser_vault_tool, "_focus_bound_origin", lambda *a, **k: None), \
              patch.object(browser_vault_tool, "_eval_js", side_effect=fake_eval):
             out = json.loads(browser_vault_tool.browser_vault_enter_code(task_id="t"))
         assert out["error_type"] == "no_code_field"
+        assert len(evaluated) == 3  # origin read, inspection, marker cleanup

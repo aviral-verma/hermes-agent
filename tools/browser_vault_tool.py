@@ -29,14 +29,21 @@ autofill (kernel-login-autofill.ts / fill_from_vault.ts).
 
 from __future__ import annotations
 
+import contextvars
 import json
-import secrets
 import logging
-from typing import Any, Dict, Optional
+import secrets
+from contextlib import contextmanager
+from typing import Any, Callable, Optional
 
 from tools.browser_vault_context import plugin_errors_as_refusal, saved_origins, snapshot_refusal, write_backend_code
 
 logger = logging.getLogger(__name__)
+
+# Bound by _fenced_page_op to the exact unnamed browser_exec route selected for this vault call. Keeping
+# provenance in a ContextVar lets every focus/read/inspection/cleanup/write re-admit the same route without
+# re-looking it up by a lossy task id.
+_browser_exec_route: contextvars.ContextVar[Any] = contextvars.ContextVar("vault_browser_exec_route", default=None)
 
 
 # ---------------------------------------------------------------------------
@@ -85,35 +92,65 @@ def _page_eval(backend: Any, task_id: str, expression: str, *, secret: bool) -> 
     return {"success": True, "result": result}
 
 
+def _route_for_page(task_id: str):
+    """The exact route bound by the handler, or an exact unnamed-route resolution for direct callers."""
+    route = _browser_exec_route.get()
+    if route is not None:
+        return route
+    from tools.browser_use_cli import _default_browser_exec_route
+
+    # Public helpers historically canonicalize a missing task to supervisor id "default". At the browser
+    # session layer that same missing task is canonically "browser-exec-default", not cache key "default".
+    return _default_browser_exec_route(None if task_id == "default" else task_id)
+
+
+def _fenced_page_access(task_id: str, fn: Callable[[], dict[str, Any]]) -> dict[str, Any]:
+    """Re-admit one page access against this call's exact browser_exec route."""
+    from tools.browser_session import run_fenced
+
+    result = run_fenced(_route_for_page(task_id).session, fn)
+    if result.get("code") == "human_has_control":
+        result.setdefault("error_type", "human_has_control")
+    return result
+
+
+def _fenced_vault_side_effect(task_id: str, fn: Callable[[], Any]) -> dict[str, Any]:
+    """Fence a non-page mutation that follows a prompt inside a page operation."""
+    def apply() -> dict[str, Any]:
+        return {"success": True, "value": fn()}
+
+    if _browser_exec_route.get() is None:
+        return apply()
+    return _fenced_page_access(task_id, apply)
+
+
 def _eval_js(task_id: str, expression: str) -> dict[str, Any]:
-    """Evaluate NON-SECRET JS on the current page (inspection, origin reads): on the plugin browser
-    holding the task's page, else over the task's CDP supervisor. Without either the call reports it."""
-    page = _page_backend(task_id)
-    if page is not None:
-        return _page_eval(page, task_id, expression, secret=False)
-    supervisor = _ensure_supervisor(task_id)
-    if supervisor is None:
-        return {"success": False, "error": "no supervised browser session for this task; open the page with "
-                                           "browser_exec first"}
-    sup = supervisor.evaluate_runtime(expression)
-    if sup.get("ok"):
-        return {"success": True, "result": sup.get("result")}
-    return {"success": False, "error": str(sup.get("error") or "evaluate failed")}
+    """Evaluate NON-SECRET JS after a fresh lease admission (inspection, origin reads and cleanup)."""
+    def evaluate() -> dict[str, Any]:
+        page = _page_backend(task_id)
+        if page is not None:
+            return _page_eval(page, task_id, expression, secret=False)
+        supervisor = _ensure_supervisor(task_id)
+        if supervisor is None:
+            return {"success": False, "error": "no supervised browser session for this task; open the page with "
+                                               "browser_exec first"}
+        sup = supervisor.evaluate_runtime(expression)
+        if sup.get("ok"):
+            return {"success": True, "result": sup.get("result")}
+        return {"success": False, "error": str(sup.get("error") or "evaluate failed")}
+
+    return _fenced_page_access(task_id, evaluate)
 
 
 def _ensure_supervisor(task_id: str):
-    """The supervisor for ``task_id`` (browser_exec attaches one on every call), attaching one on demand to
-    the task's session CDP endpoint when none is running. None when no endpoint is known; a fill then
-    refuses rather than touching argv."""
-    from tools.browser_supervisor import SUPERVISOR_REGISTRY
+    """Return the task supervisor, attaching to its endpoint or initializing browser_exec's default route.
 
-    supervisor = SUPERVISOR_REGISTRY.get(task_id)
-    if supervisor is not None:
-        return supervisor
-    from tools.browser_session import session_for_task
+    None when neither path exposes CDP; a fill then refuses rather than touching subprocess argv.
+    """
+    from tools.browser_supervisor import SUPERVISOR_REGISTRY
     from tools.browser_session_cdp import get_dialog_policy_config, resolve_cdp_override
 
-    cdp_url = str(session_for_task(task_id).get("cdp_url") or "")
+    cdp_url = _route_for_page(task_id).cdp_url
     if not cdp_url:
         return None
     policy, timeout_s = get_dialog_policy_config()
@@ -135,48 +172,42 @@ def _eval_js_secret(task_id: str, expression: str) -> dict[str, Any]:
     nothing is written. A plugin browser holding the task's page (no CDP endpoint) carries the
     expression over its own transport instead; see ``agent.browser_page_backend``.
     """
-    page = _page_backend(task_id)
-    supervisor = None
-    if page is None:
-        try:
-            supervisor = _ensure_supervisor(task_id)
-        except Exception as exc:
-            logger.debug("vault fill: supervisor unavailable (%s)", exc)
+    def evaluate() -> dict[str, Any]:
+        page = _page_backend(task_id)
+        supervisor = None
+        if page is None:
+            try:
+                supervisor = _ensure_supervisor(task_id)
+            except Exception as exc:
+                logger.debug("vault fill: supervisor unavailable (%s)", exc)
 
-    if page is None and supervisor is None:
+        if page is None and supervisor is None:
+            return {
+                "success": False,
+                "error_type": "supervisor_required",
+                "error": (
+                    "Vault fill requires the supervised browser session (direct "
+                    "CDP WebSocket), and this task has none. Open the page with "
+                    "browser_exec and retry."
+                ),
+            }
+
+        if page is not None:
+            return _page_eval(page, task_id, expression, secret=True)
+        sup = supervisor.evaluate_runtime(expression)
+        if sup.get("ok"):
+            return {"success": True, "result": sup.get("result")}
         return {
             "success": False,
-            "error_type": "supervisor_required",
-            "error": (
-                "Vault fill requires the supervised browser session (direct "
-                "CDP WebSocket), and this task has none. Open the page with "
-                "browser_exec and retry."
-            ),
+            "error_type": "supervisor_required"
+            if "supervisor" in str(sup.get("error") or "").lower()
+            else "eval_failed",
+            "error": str(sup.get("error") or "eval failed"),
         }
 
-    # Re-admit at the WRITE. The handler-level fence (_fenced_page_op) admitted before a possibly
-    # human-length prompt (enter_code waits for the user's code); a takeover during that wait must
-    # refuse here, before the credential lands in a page the human is now typing into. The outer
-    # epoch check only discards the result, and a fill is a side effect, not a result.
-    if _bot_desktop_browser_session(task_id):
-        from tools.bot_desktop import lease as _bd_lease
-        try:
-            _bd_lease.assert_agent_may_act()
-        except _bd_lease.HumanHasControl as exc:
-            return {"success": False, "error_type": "human_has_control", "error": str(exc)}
-
-    if page is not None:
-        return _page_eval(page, task_id, expression, secret=True)
-    sup = supervisor.evaluate_runtime(expression)
-    if sup.get("ok"):
-        return {"success": True, "result": sup.get("result")}
-    return {
-        "success": False,
-        "error_type": "supervisor_required"
-        if "supervisor" in str(sup.get("error") or "").lower()
-        else "eval_failed",
-        "error": str(sup.get("error") or "eval failed"),
-    }
+    # The handler-level fence admitted before a possibly human-length prompt. Re-admit at the WRITE:
+    # the outer epoch check only discards the result, while a fill is an irreversible page side effect.
+    return _fenced_page_access(task_id, evaluate)
 
 
 def _parse_json_result(raw: Any) -> Any:
@@ -186,6 +217,17 @@ def _parse_json_result(raw: Any) -> Any:
         except (json.JSONDecodeError, ValueError):
             return raw
     return raw
+
+
+@contextmanager
+def _inspection_marker_scope(task_id: str, nonce: str, expected_origin: str):
+    """Remove an inspection's non-secret DOM markers on every exit, including no-fill refusals."""
+    try:
+        yield
+    finally:
+        from agent.vault_login_classifier import build_cleanup_js
+
+        _eval_js(task_id, build_cleanup_js(nonce, expected_origin))
 
 
 def _current_page_origin(task_id: str) -> Optional[str]:
@@ -204,10 +246,23 @@ def _current_page_origin(task_id: str) -> Optional[str]:
 
 
 def _deep_probe(selector: str) -> str:
-    """A JS expression truthy when ``selector`` matches in the document or any open shadow root (the
-    inspection and fill scripts reach shadow-root forms, so tab selection must too)."""
-    return ("((s) => { const w = (r) => r.querySelector(s) || Array.from(r.querySelectorAll('*'))"
-            ".some((e) => e.shadowRoot && w(e.shadowRoot)); return !!w(document); })(" + json.dumps(selector) + ")")
+    """A JS expression truthy when ``selector`` matches in the root document or a reachable subtree.
+
+    Tab choice mirrors inspection: open shadow roots and exact-same-origin iframe documents are reachable;
+    cross-origin, opaque-origin and sandboxed-without-allow-same-origin frames are not even probed.
+    """
+    return ("((s) => { const seen = new Set(); const a = (f) => !f.hasAttribute('sandbox') || "
+            "f.sandbox.contains('allow-same-origin'); const g = (doc) => { try { if (!doc || !doc.defaultView) "
+            "return ''; const v = doc.defaultView; const x = v.location.origin; if (x !== 'null') return x; "
+            "const f = v.frameElement; return (v.location.href === 'about:blank' || v.location.href === "
+            "'about:srcdoc') && f && a(f) && f.contentDocument === doc ? g(f.ownerDocument) : x; } catch (_) "
+            "{ return ''; } }; const o = g(document); if (!o || o === 'null') return false; "
+            "const d = (doc) => { if (!doc || seen.has(doc)) "
+            "return false; seen.add(doc); return w(doc); }; const w = (r) => { if (r.querySelector(s)) "
+            "return true; for (const e of r.querySelectorAll('*')) { if (e.shadowRoot && w(e.shadowRoot)) "
+            "return true; if (e.tagName !== 'IFRAME' || !a(e)) continue; try { const c = e.contentDocument; "
+            "if (c && g(c) === o && d(c)) return true; } catch (_) {} "
+            "} return false; }; return d(document); })(" + json.dumps(selector) + ")")
 
 
 # Per kind: a JS probe that is truthy on a tab holding the form this kind fills.
@@ -223,15 +278,18 @@ def _focus_bound_origin(task_id: str, origin: str, kind: str) -> Optional[str]:
     (browser_exec sessions open their own tabs, so the tab the supervisor attached to first is rarely the
     login page). Returns the origin when a tab was focused, else None (caller falls back to the current page).
     A plugin page backend's current page IS the tab the agent drove, so there is nothing to focus."""
-    if _page_backend(task_id) is not None:
-        return None
-    try:
-        supervisor = _ensure_supervisor(task_id)
-    except Exception:
-        supervisor = None
-    if supervisor is None:
-        return None
-    focused = supervisor.focus_page(origin, accept=_TAB_PROBES.get(kind))
+    def focus() -> dict[str, Any]:
+        if _page_backend(task_id) is not None:
+            return {"ok": False}
+        try:
+            supervisor = _ensure_supervisor(task_id)
+        except Exception:
+            supervisor = None
+        if supervisor is None:
+            return {"ok": False}
+        return supervisor.focus_page(origin, accept=_TAB_PROBES.get(kind))
+
+    focused = _fenced_page_access(task_id, focus)
     return (origin or focused.get("url")) if focused.get("ok") else None
 
 
@@ -326,7 +384,11 @@ def browser_vault_unlock(backend_name: str) -> str:
         return json.dumps({"success": False, "error_type": "unlock_cancelled",
                            "error": f"The user declined to unlock {backend.display_name}."})
     try:
-        backend.unlock(master)  # type: ignore[attr-defined]
+        unlocked = _fenced_vault_side_effect(
+            "default", lambda: backend.unlock(master)  # type: ignore[attr-defined]
+        )
+        if not unlocked.get("success"):
+            return json.dumps(unlocked)
     except Exception as exc:
         return json.dumps({"success": False, "error_type": "unlock_failed", "error": str(exc)[:300]})
     finally:
@@ -361,8 +423,16 @@ def browser_vault_save_login(label: str = "", task_id: Optional[str] = None) -> 
     identifier = str(answer["identifier"]).strip()
     id_type = "email" if "@" in identifier else ("phone" if identifier.lstrip("+").isdigit() else "username")
     try:
-        meta = get_vault_store().add_item("login", site, {"identifier_type": id_type, "identifier": identifier,
-                                                        "password": str(answer["password"])}, origin=origin)
+        stored = _fenced_vault_side_effect(
+            effective_task_id,
+            lambda: get_vault_store().add_item(
+                "login", site, {"identifier_type": id_type, "identifier": identifier,
+                                "password": str(answer["password"])}, origin=origin
+            ),
+        )
+        if not stored.get("success"):
+            return json.dumps(stored)
+        meta = stored["value"]
     except Exception as exc:
         return json.dumps({"success": False, "error_type": "save_failed", "error": str(exc)[:200]})
     finally:
@@ -398,9 +468,7 @@ def browser_vault_enter_code(handle: str = "", task_id: Optional[str] = None) ->
     authenticator seed, the code is minted server-side and nobody is asked; otherwise the user is prompted on
     their surface for the code their phone/email/app shows. The code goes into the page over the supervisor
     socket and never enters the conversation. A saved login's code is only minted on its saved origin(s)."""
-    from agent.redact import register_vault_redaction_value
-    from agent.vault_backends.unlock import can_prompt_here, get_code_prompt_callback
-    from agent.vault_login_classifier import LoginControl, build_fill_js, build_inspection_js, build_otp_fills, classify_otp_controls
+    from agent.vault_login_classifier import build_inspection_js
 
     effective_task_id = task_id or "default"
     backend, meta = _saved_login(handle)
@@ -417,10 +485,32 @@ def browser_vault_enter_code(handle: str = "", task_id: Optional[str] = None) ->
         origin = _current_page_origin(effective_task_id)
         if not origin:
             return json.dumps({"success": False, "error": "No page with a code field is open."})
-    site = origin.split("://", 1)[-1]
-
     nonce = secrets.token_hex(8)
     inspect = _eval_js(effective_task_id, build_inspection_js(nonce))
+    with _inspection_marker_scope(effective_task_id, nonce, origin):
+        return _enter_code_from_inspection(backend, meta, handle, origin, effective_task_id, nonce, inspect)
+
+
+def _enter_code_from_inspection(
+    backend: Any,
+    meta: Any,
+    handle: str,
+    origin: str,
+    effective_task_id: str,
+    nonce: str,
+    inspect: dict[str, Any],
+) -> str:
+    """Classify and fill an OTP while the caller owns the inspection-marker cleanup scope."""
+    from agent.redact import register_vault_redaction_value
+    from agent.vault_backends.unlock import can_prompt_here, get_code_prompt_callback
+    from agent.vault_login_classifier import (
+        LoginControl,
+        build_fill_js,
+        build_otp_fills,
+        classify_otp_controls,
+    )
+
+    site = origin.split("://", 1)[-1]
     raw_controls = _parse_json_result(inspect.get("result")) if inspect.get("success") else None
     if isinstance(raw_controls, str):
         raw_controls = _parse_json_result(raw_controls)
@@ -515,12 +605,34 @@ def browser_vault_fill(handle: str, task_id: Optional[str] = None) -> str:
 def _fill_bound_page(backend: Any, handle: str, meta: Any, page_origin: str, effective_task_id: str) -> str:
     """Inspect the page, resolve the item's secret and write it; runs inside the backend's fill_context
     after the origin guard passed."""
+    from agent.vault_login_classifier import build_inspection_js
+
+    # ── Inspect + classify page controls ────────────────────────────────────
+    nonce = secrets.token_hex(8)  # binds this fill to THIS inspection's stamps
+    inspect = _eval_js(effective_task_id, build_inspection_js(nonce))
+    with _inspection_marker_scope(effective_task_id, nonce, page_origin):
+        if not inspect.get("success"):
+            return json.dumps(
+                {"success": False, "error": f"Could not inspect page inputs: {inspect.get('error', 'eval failed')}"}
+            )
+        return _fill_inspected_page(backend, handle, meta, page_origin, effective_task_id, nonce, inspect)
+
+
+def _fill_inspected_page(
+    backend: Any,
+    handle: str,
+    meta: Any,
+    page_origin: str,
+    effective_task_id: str,
+    nonce: str,
+    inspect: dict[str, Any],
+) -> str:
+    """Classify, resolve and fill controls while the caller owns marker cleanup."""
     from agent.redact import register_vault_redaction_value
     from agent.vault_login_classifier import (
         ClassifiedLoginControl,
         LoginControl,
         build_fill_js,
-        build_inspection_js,
         classify_checkout_control,
         classify_login_control,
         select_checkout_fills,
@@ -529,13 +641,6 @@ def _fill_bound_page(backend: Any, handle: str, meta: Any, page_origin: str, eff
     from agent.vault_backends import UnlockRequired
     from agent.vault_store import ADDRESS_FIELDS, PAYMENT_FIELDS, scrub_secret_from_text
 
-    # ── Inspect + classify page controls ────────────────────────────────────
-    nonce = secrets.token_hex(8)  # binds this fill to THIS inspection's stamps
-    inspect = _eval_js(effective_task_id, build_inspection_js(nonce))
-    if not inspect.get("success"):
-        return json.dumps(
-            {"success": False, "error": f"Could not inspect page inputs: {inspect.get('error', 'eval failed')}"}
-        )
     raw_controls = _parse_json_result(inspect.get("result"))
     if isinstance(raw_controls, str):
         raw_controls = _parse_json_result(raw_controls)
@@ -664,19 +769,22 @@ BROWSER_VAULT_SCHEMA = {
 }
 
 
-def _bot_desktop_browser_session(task_id: Optional[str]) -> bool:
-    from tools.browser_session import session_for_task, shares_bot_desktop_browser
-    return shares_bot_desktop_browser(session_for_task(task_id))
-
-
 def _fenced_page_op(task_id: Optional[str], fn) -> str:
     """Vault operations focus, inspect and fill the page over the supervisor socket, bypassing
     browser_exec; they must honour the Bot Desktop lease like every other page access, or a human
     typing a credential on the taken-over screen could be read or written to."""
-    from tools.browser_session import run_fenced, session_for_task
+    from tools.browser_session import run_fenced
+    from tools.browser_use_cli import BrowserExecRoute, _default_browser_exec_route
 
-    res = run_fenced(session_for_task(task_id), lambda: {"raw": fn()})
-    return res["raw"] if "raw" in res else json.dumps(res)
+    effective_task_id = task_id or "default"
+    route = (BrowserExecRoute(cdp_url="", session={}) if _page_backend(effective_task_id) is not None
+             else _default_browser_exec_route(task_id))
+    token = _browser_exec_route.set(route)
+    try:
+        res = run_fenced(route.session, lambda: {"raw": fn()})
+        return res["raw"] if "raw" in res else json.dumps(res)
+    finally:
+        _browser_exec_route.reset(token)
 
 
 def _handle_vault(args: dict[str, Any], **kwargs) -> str:

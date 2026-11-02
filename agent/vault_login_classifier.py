@@ -74,11 +74,13 @@ class LoginControl:
     name: str
     type: str
     max_length: Optional[int] = None
+    frame_path: tuple[int, ...] = ()
 
     @classmethod
     def from_dict(cls, raw: dict[str, Any]) -> LoginControl:
         form_index = raw.get("formIndex", raw.get("form_index"))
         max_length = raw.get("maxLength", raw.get("max_length"))
+        raw_frame_path = raw.get("framePath", raw.get("frame_path")) or ()
         return cls(
             autocomplete=str(raw.get("autocomplete") or ""),
             form_index=int(form_index) if form_index is not None else None,
@@ -87,6 +89,7 @@ class LoginControl:
             name=str(raw.get("name") or ""),
             type=str(raw.get("type") or ""),
             max_length=int(max_length) if max_length is not None else None,
+            frame_path=tuple(int(part) for part in raw_frame_path),
         )
 
 
@@ -163,19 +166,21 @@ def select_password_fill(
     metadata and is typed by the agent via normal input tools. This picks
     the highest-scoring ``current-password`` control (ties broken by DOM
     order) and returns ``[{"index": int, "token": "current-password",
-    "value": password}]`` or ``[]`` when no password field exists.
+    "value": password}]`` or ``[]`` when no password field exists. A control in a same-origin frame
+    retains its inspected frame path so the write can revalidate that destination.
     """
     passwords = [c for c in classified if c.token == "current-password"]
     if not passwords or not password:
         return []
     best_password = min(passwords, key=lambda c: (-c.score, c.control.index))
-    return [
-        {
-            "index": best_password.control.index,
-            "token": "current-password",
-            "value": password,
-        }
-    ]
+    fill = {
+        "index": best_password.control.index,
+        "token": "current-password",
+        "value": password,
+    }
+    if best_password.control.frame_path:
+        fill["frame_path"] = best_password.control.frame_path
+    return [fill]
 
 
 def classify_checkout_control(control: LoginControl) -> Optional[ClassifiedLoginControl]:
@@ -210,7 +215,11 @@ def select_checkout_fills(classified: list[ClassifiedLoginControl], secret: dict
     for token, value in values.items():
         candidates = sorted((c for c in classified if c.token == token), key=lambda c: (-c.score, c.control.index))
         if candidates:
-            fills.append({"index": candidates[0].control.index, "token": token, "value": value})
+            control = candidates[0].control
+            fill = {"index": control.index, "token": token, "value": value}
+            if control.frame_path:
+                fill["frame_path"] = control.frame_path
+            fills.append(fill)
     if any(f["token"] == "cc-exp" for f in fills):
         fills = [f for f in fills if f["token"] not in ("cc-exp-month", "cc-exp-year")]
     return fills
@@ -218,10 +227,11 @@ def select_checkout_fills(classified: list[ClassifiedLoginControl], secret: dict
 
 # JS expression evaluated in the page to inspect candidate input controls.
 # Ported from OpenInstinct's nativeLoginControlInspectionExpression.
-# Inspection stamps every input with ``<nonce>:<index>`` under a per-inspection attribute; the fill
-# script resolves targets by the stamp of ITS OWN inspection instead of re-querying by position, so
-# neither a DOM reflow nor a second inspection in between can redirect the password into another field.
+# Inspection stamps every input and reachable same-origin frame under a per-inspection nonce; the fill
+# script resolves the target and its frame chain from ITS OWN inspection instead of re-querying by position,
+# so neither a DOM reflow nor a second inspection in between can redirect a secret into another field.
 INSPECTION_STAMP_ATTR = "data-hermes-vault-slot"
+FRAME_STAMP_ATTR = "data-hermes-vault-frame"
 
 
 def build_otp_fills(otp_controls: list[ClassifiedLoginControl], code: str) -> list[dict[str, Any]]:
@@ -235,9 +245,17 @@ def build_otp_fills(otp_controls: list[ClassifiedLoginControl], code: str) -> li
     boxes = sorted((c for c in otp_controls if c.control.max_length == 1), key=lambda c: c.control.index)
     if (len(boxes) == len(code)
             and len({b.control.form_index for b in boxes}) == 1
+            and len({b.control.frame_path for b in boxes}) == 1
             and all(b.control.index - a.control.index == 1 for a, b in itertools.pairwise(boxes))):
-        return [{"index": b.control.index, "token": "one-time-code", "value": ch} for b, ch in zip(boxes, code)]
-    return [{"index": best.control.index, "token": "one-time-code", "value": code}]
+        fills = [{"index": b.control.index, "token": "one-time-code", "value": ch,
+                  "frame_path": b.control.frame_path} for b, ch in zip(boxes, code)]
+    else:
+        fills = [{"index": best.control.index, "token": "one-time-code", "value": code,
+                  "frame_path": best.control.frame_path}]
+    for fill in fills:
+        if not fill["frame_path"]:
+            del fill["frame_path"]
+    return fills
 
 
 def build_inspection_js(nonce: str) -> str:
@@ -246,25 +264,55 @@ def build_inspection_js(nonce: str) -> str:
 
 _LOGIN_CONTROL_INSPECTION_JS_TEMPLATE = """(() => {
   const nonce = __NONCE__;
-  // Shadow-piercing collect: many logins (Home Assistant, custom-element SPAs) render their
-  // form inside a shadow root, where document.querySelectorAll never sees it. Walk every
-  // element (shadow hosts can be anything, not just inputs) and recurse into open shadow roots.
-  // Forms are collected in the same walk: document.forms misses a <form> inside a shadow root, which
-  // would leave its controls ungrouped (formIndex null) and merge split OTP boxes across forms.
+  const expectedOrigin = window.location.origin;
+  if (!expectedOrigin || expectedOrigin === "null") return JSON.stringify([]);
   const elements = [];
   const forms = [];
-  (function walk(root) {
-    for (const e of root.querySelectorAll("*")) {
-      if (e.tagName === "INPUT" || e.tagName === "SELECT") elements.push(e);
-      else if (e.tagName === "FORM") forms.push(e);
-      if (e.shadowRoot) walk(e.shadowRoot);
+  const seenDocuments = new Set();
+  let nextFrame = 0;
+  const frameAllowsSameOrigin = (frame) =>
+    !frame.hasAttribute("sandbox") || frame.sandbox.contains("allow-same-origin");
+  const documentOrigin = (doc) => {
+    try {
+      if (!doc || !doc.defaultView) return "";
+      const view = doc.defaultView;
+      const origin = view.location.origin;
+      if (origin !== "null") return origin;
+      const frame = view.frameElement;
+      if ((view.location.href === "about:blank" || view.location.href === "about:srcdoc") && frame &&
+          frameAllowsSameOrigin(frame) && frame.contentDocument === doc) return documentOrigin(frame.ownerDocument);
+      return origin;
     }
-  })(document);
-  elements.forEach((element, index) => element.setAttribute("data-hermes-vault-slot", nonce + ":" + index));
-  const out = elements.flatMap((element, index) => {
+    catch (_) { return ""; }
+  };
+  const walkRoot = (root, framePath) => {
+    for (const e of root.querySelectorAll("*")) {
+      if (e.tagName === "INPUT" || e.tagName === "SELECT") elements.push({ element: e, framePath });
+      else if (e.tagName === "FORM") forms.push(e);
+      if (e.shadowRoot) walkRoot(e.shadowRoot, framePath);
+      if (e.tagName !== "IFRAME" || !frameAllowsSameOrigin(e)) continue;
+      try {
+        const child = e.contentDocument;
+        if (!child || documentOrigin(child) !== expectedOrigin) continue;
+        const frameIndex = nextFrame++;
+        e.setAttribute("data-hermes-vault-frame", nonce + ":" + frameIndex);
+        walkDocument(child, [...framePath, frameIndex]);
+      } catch (_) { /* cross-origin, opaque, or detached frame */ }
+    }
+  };
+  const walkDocument = (doc, framePath) => {
+    if (seenDocuments.has(doc)) return;
+    seenDocuments.add(doc);
+    walkRoot(doc, framePath);
+  };
+  walkDocument(document, []);
+  elements.forEach(({ element }, index) => element.setAttribute("data-hermes-vault-slot", nonce + ":" + index));
+  const out = elements.flatMap(({ element, framePath }, index) => {
     if (element.disabled || element.readOnly) return [];
     if (["hidden", "submit", "button", "reset", "file", "image", "checkbox", "radio"].includes(element.type)) return [];
-    const style = getComputedStyle(element);
+    const view = element.ownerDocument.defaultView;
+    if (!view || documentOrigin(element.ownerDocument) !== expectedOrigin) return [];
+    const style = view.getComputedStyle(element);
     if (style.display === "none" || style.visibility === "hidden" || element.getClientRects().length === 0) return [];
     const labels = element.labels ? Array.from(element.labels, (l) => l.textContent || "") : [];
     const ariaText = (element.getAttribute("aria-labelledby") || "")
@@ -274,6 +322,7 @@ _LOGIN_CONTROL_INSPECTION_JS_TEMPLATE = """(() => {
     const resolvedFormIndex = element.form ? forms.indexOf(element.form) : -1;
     return [{
       autocomplete: element.autocomplete || "",
+      framePath,
       formIndex: resolvedFormIndex >= 0 ? resolvedFormIndex : null,
       index,
       maxLength: element.maxLength > 0 ? element.maxLength : null,
@@ -296,19 +345,26 @@ def build_fill_js(fills: list[dict[str, Any]], expected_origin: str, nonce: str 
     """Build a JS expression that fills the selected controls and reports only a count. The
     returned expression never echoes the values back.
 
-    ``expected_origin`` is asserted against ``window.location.origin`` synchronously inside the SAME
-    evaluated script, immediately before any write. If the page navigated between inspection and fill
-    (TOCTOU), the script writes nothing and returns ``{"refused": "origin_changed", "found": <actual>}``:
-    proof scope equals mutation scope (#88706). Targets resolve by the ``<nonce>:<index>`` stamp of
-    THIS inspection; a ``current-password`` fill additionally requires ``type=password``; ``<select>``
-    controls (country, state, expiry month) match an option by value or visible text. No marker is
-    left on filled controls so later model-driven DOM reads cannot address them deterministically.
+    ``expected_origin`` is asserted against the root and stamped destination frame chain inside the SAME
+    evaluated script, immediately before any write. If either navigated between inspection and fill
+    (TOCTOU), the script writes nothing to that destination and returns
+    ``{"refused": "origin_changed", "found": <actual>}``: proof scope equals mutation scope (#88706).
+    Cross-origin, opaque and sandboxed-without-allow-same-origin frames are unreachable. A
+    ``current-password`` fill additionally requires ``type=password``; ``<select>`` controls (country,
+    state, expiry month) match an option by value or visible text. No marker is left on filled controls.
     """
     payload = json.dumps(
-        [{"index": f["index"], "token": f.get("token", "current-password"), "value": f["value"]} for f in fills]
+        [{"index": f["index"], "token": f.get("token", "current-password"), "value": f["value"],
+          "framePath": list(f.get("frame_path") or f.get("framePath") or ())} for f in fills]
     )
     return (_FILL_JS_TEMPLATE.replace("__EXPECTED_ORIGIN__", json.dumps(expected_origin))
             .replace("__FILLS__", payload).replace("__NONCE__", json.dumps(nonce)))
+
+
+def build_cleanup_js(nonce: str, expected_origin: str) -> str:
+    """Remove this inspection's slot and frame markers from every reachable destination document."""
+    return (_CLEANUP_JS_TEMPLATE.replace("__EXPECTED_ORIGIN__", json.dumps(expected_origin))
+            .replace("__NONCE__", json.dumps(nonce)))
 
 
 _FILL_JS_TEMPLATE = """(() => {
@@ -318,36 +374,157 @@ _FILL_JS_TEMPLATE = """(() => {
   }
   const fills = __FILLS__;
   const nonce = __NONCE__;
-  // Stamped controls may live inside a shadow root (see the inspection script's walk): collect the
-  // document and every open shadow root once, then look each stamp up in those roots.
-  const roots = [];
-  (function walk(root) {
-    roots.push(root);
-    for (const e of root.querySelectorAll("*")) if (e.shadowRoot) walk(e.shadowRoot);
-  })(document);
-  const find = (selector) => roots.flatMap((r) => Array.from(r.querySelectorAll(selector)));
+  const frameAllowsSameOrigin = (frame) =>
+    !frame.hasAttribute("sandbox") || frame.sandbox.contains("allow-same-origin");
+  const documentOrigin = (doc) => {
+    try {
+      if (!doc || !doc.defaultView) return "";
+      const view = doc.defaultView;
+      const origin = view.location.origin;
+      if (origin !== "null") return origin;
+      const frame = view.frameElement;
+      if ((view.location.href === "about:blank" || view.location.href === "about:srcdoc") && frame &&
+          frameAllowsSameOrigin(frame) && frame.contentDocument === doc) return documentOrigin(frame.ownerDocument);
+      return origin;
+    }
+    catch (_) { return ""; }
+  };
+  const rootsFor = (doc) => {
+    const roots = [];
+    const walk = (root) => {
+      roots.push(root);
+      for (const e of root.querySelectorAll("*")) if (e.shadowRoot) walk(e.shadowRoot);
+    };
+    walk(doc);
+    return roots;
+  };
+  const findIn = (doc, selector) => rootsFor(doc).flatMap((root) => Array.from(root.querySelectorAll(selector)));
+  const refuse = (found) => {
+    cleanup();
+    return JSON.stringify({ refused: "origin_changed", found: found || "unavailable" });
+  };
+  const destinationFor = (framePath) => {
+    let doc = document;
+    for (const frameIndex of framePath) {
+      const frame = findIn(doc, '[data-hermes-vault-frame="' + nonce + ':' + frameIndex + '"]')[0];
+      if (!frame || frame.tagName !== "IFRAME") return { refused: "missing-frame" };
+      if (!frameAllowsSameOrigin(frame)) return { refused: "sandboxed" };
+      try {
+        const child = frame.contentDocument;
+        const found = documentOrigin(child);
+        if (!child || found !== expectedOrigin) return { refused: found || "cross-origin" };
+        doc = child;
+      } catch (_) { return { refused: "cross-origin" }; }
+    }
+    return { doc };
+  };
+  const targets = [];
+  for (const f of fills) {
+    const destination = destinationFor(f.framePath || []);
+    if (destination.refused) return refuse(destination.refused);
+    const el = findIn(destination.doc, '[data-hermes-vault-slot="' + nonce + ':' + f.index + '"]')[0];
+    if (el && documentOrigin(el.ownerDocument) !== expectedOrigin) return refuse(documentOrigin(el.ownerDocument));
+    targets.push({ f, el });
+  }
   let filled = 0;
   const norm = (t) => String(t || "").trim().toLowerCase();
-  for (const f of fills) {
-    const el = find('[data-hermes-vault-slot="' + nonce + ':' + f.index + '"]')[0];
+  const originStillBound = (el) =>
+    window.location.origin === expectedOrigin && documentOrigin(el.ownerDocument) === expectedOrigin;
+  for (const { f, el } of targets) {
     if (!el || (f.token === "current-password" && el.type !== "password")) continue;
     try {
       if (el.tagName === "SELECT") {
+        if (!originStillBound(el)) return refuse(documentOrigin(el.ownerDocument));
         const want = norm(f.value);
         const opt = Array.from(el.options).find((o) => [o.value, o.textContent].some((t) => norm(t) === want || norm(t) === want.replace(/^0/, "")));
-        if (opt) { el.value = opt.value; el.dispatchEvent(new Event("change", { bubbles: true, composed: true })); filled += 1; }
+        if (opt) {
+          const view = el.ownerDocument.defaultView;
+          el.value = opt.value;
+          el.dispatchEvent(new view.Event("change", { bubbles: true, composed: true }));
+          filled += 1;
+        }
         continue;
       }
       el.focus();
-      const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value");
+      if (!originStillBound(el)) return refuse(documentOrigin(el.ownerDocument));
+      const view = el.ownerDocument.defaultView;
+      const setter = Object.getOwnPropertyDescriptor(view.HTMLInputElement.prototype, "value");
       // one-time-code split into single-character boxes: f.value is the slice for THIS box (see build_otp_fills)
       if (setter && setter.set) { setter.set.call(el, f.value); } else { el.value = f.value; }
       // composed: a component listening on its shadow host must see the value change too.
-      el.dispatchEvent(new InputEvent("input", { bubbles: true, composed: true, inputType: "insertText" }));
-      el.dispatchEvent(new Event("change", { bubbles: true, composed: true }));
+      el.dispatchEvent(new view.InputEvent("input", { bubbles: true, composed: true, inputType: "insertText" }));
+      el.dispatchEvent(new view.Event("change", { bubbles: true, composed: true }));
       if (el.value.length > 0) filled += 1;
     } catch (e) { /* skip */ }
   }
-  find("[data-hermes-vault-slot]").forEach((n) => n.removeAttribute("data-hermes-vault-slot"));
+  function cleanup() {
+    const seen = new Set();
+    const walkDocument = (doc) => {
+      if (!doc || seen.has(doc) || documentOrigin(doc) !== expectedOrigin) return;
+      seen.add(doc);
+      for (const root of rootsFor(doc)) {
+        for (const node of root.querySelectorAll("[data-hermes-vault-slot], [data-hermes-vault-frame]")) {
+          if ((node.getAttribute("data-hermes-vault-slot") || "").startsWith(nonce + ":")) {
+            node.removeAttribute("data-hermes-vault-slot");
+          }
+          if ((node.getAttribute("data-hermes-vault-frame") || "").startsWith(nonce + ":")) {
+            node.removeAttribute("data-hermes-vault-frame");
+          }
+        }
+        for (const frame of root.querySelectorAll("iframe")) {
+          if (!frameAllowsSameOrigin(frame)) continue;
+          try { walkDocument(frame.contentDocument); } catch (_) { /* inaccessible destination */ }
+        }
+      }
+    };
+    walkDocument(document);
+  }
+  cleanup();
   return JSON.stringify({ filled });
+})()"""
+
+
+_CLEANUP_JS_TEMPLATE = """(() => {
+  const expectedOrigin = __EXPECTED_ORIGIN__;
+  const nonce = __NONCE__;
+  const frameAllowsSameOrigin = (frame) =>
+    !frame.hasAttribute("sandbox") || frame.sandbox.contains("allow-same-origin");
+  const documentOrigin = (doc) => {
+    try {
+      if (!doc || !doc.defaultView) return "";
+      const view = doc.defaultView;
+      const origin = view.location.origin;
+      if (origin !== "null") return origin;
+      const frame = view.frameElement;
+      if ((view.location.href === "about:blank" || view.location.href === "about:srcdoc") && frame &&
+          frameAllowsSameOrigin(frame) && frame.contentDocument === doc) return documentOrigin(frame.ownerDocument);
+      return origin;
+    }
+    catch (_) { return ""; }
+  };
+  if (documentOrigin(document) !== expectedOrigin) return JSON.stringify({ cleaned: 0 });
+  const seen = new Set();
+  let cleaned = 0;
+  const walkRoot = (root) => {
+    for (const node of root.querySelectorAll("*")) {
+      if ((node.getAttribute("data-hermes-vault-slot") || "").startsWith(nonce + ":")) {
+        node.removeAttribute("data-hermes-vault-slot");
+        cleaned += 1;
+      }
+      if ((node.getAttribute("data-hermes-vault-frame") || "").startsWith(nonce + ":")) {
+        node.removeAttribute("data-hermes-vault-frame");
+        cleaned += 1;
+      }
+      if (node.shadowRoot) walkRoot(node.shadowRoot);
+      if (node.tagName !== "IFRAME" || !frameAllowsSameOrigin(node)) continue;
+      try { walkDocument(node.contentDocument); } catch (_) { /* inaccessible destination */ }
+    }
+  };
+  const walkDocument = (doc) => {
+    if (!doc || seen.has(doc) || documentOrigin(doc) !== expectedOrigin) return;
+    seen.add(doc);
+    walkRoot(doc);
+  };
+  walkDocument(document);
+  return JSON.stringify({ cleaned });
 })()"""

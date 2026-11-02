@@ -45,12 +45,22 @@ _PRIVATE_BROWSER_SENTINEL = "_HERMES_BU_PRIVATE_BROWSER"
 # Internal route provenance: this exec resolved to a browser on the Bot Desktop display and must use
 # the same human-control lease fence as the built-in browser tools. Popped before launching the CLI.
 _BOT_DESKTOP_BROWSER_SENTINEL = "_HERMES_BU_BOT_DESKTOP_BROWSER"
+# The exact session/provenance selected by the route resolver. The object key cannot collide with a real
+# environment variable, and every caller pops it before launching a subprocess. Vault uses it to fence the
+# same browser route browser_exec selected, including hybrid sidecars and direct real-profile attaches.
+_ROUTE_SESSION_SENTINEL = object()
 # The note when the consented real profile could not load (the route fell back). Popped before launch.
 _REAL_PROFILE_FALLBACK_SENTINEL = "_HERMES_BU_REAL_PROFILE_FALLBACK"
 # local=True whose real profile could not load: run on the local sidecar browser. Popped before launch.
 _LOCAL_FALLBACK_SENTINEL = "_HERMES_BU_LOCAL_FALLBACK"
 # Where new/hidden tabs may be brought to the front: a browser_use_shot.ACTIVATE_* mode. Popped before launch.
 _CLOUD_BROWSER_SENTINEL = "_HERMES_BU_CLOUD_BROWSER"
+
+
+class BrowserExecRoute(NamedTuple):
+    cdp_url: str
+    session: dict[str, Any]
+
 
 # Prepended to the model's code for named sessions on SHARED browsers (a /browser connect CDP override): the
 # harness daemon attaches to the first existing page at startup, so two fresh named daemons can land on the
@@ -370,6 +380,11 @@ def _mark_local_browser(env: dict, session: dict, key: str) -> None:
     _export_real_profile_note(env, key)
 
 
+def _remember_route_session(env: dict, session: dict[str, Any]) -> None:
+    """Carry the resolver's exact session to in-process consumers; never export it to a child."""
+    env[_ROUTE_SESSION_SENTINEL] = dict(session)
+
+
 def _resolve_local_cdp(env: dict, task_id: Optional[str], session_name: str = "",
                        sidecar: bool = False) -> Optional[str]:
     """Local browser for this cache key through the session layer: the consented real profile, Lightpanda
@@ -392,6 +407,7 @@ def _resolve_local_cdp(env: dict, task_id: Optional[str], session_name: str = ""
                           "Run `hermes tools` → Browser Automation to (re)install Chromium, or switch backends.")
     err = _export_session_cdp(env, _session_info, key, fail, "The local browser session returned no CDP endpoint.")
     if err is None:
+        _remember_route_session(env, session)
         _mark_local_browser(env, session, key)
     return err
 
@@ -414,6 +430,9 @@ def _resolve_backend_cdp(env: dict, task_id: Optional[str], session_name: str = 
     key (hybrid routing; see ``browser_url_policy.hybrid_routes_locally``). It sits BELOW the two operator overrides, and the
     sidecar verdict never fires while a CDP override is set."""
     if _has_cdp_env(env):
+        if _ROUTE_SESSION_SENTINEL not in env:
+            cdp = str(env.get("BU_CDP_WS") or env.get("BU_CDP_URL") or "")
+            _remember_route_session(env, {"cdp_url": cdp, "features": {"operator_cdp": True}})
         return None
     from tools.browser_session import get_session_info
     from tools.browser_session_cdp import get_cdp_override
@@ -421,6 +440,7 @@ def _resolve_backend_cdp(env: dict, task_id: Optional[str], session_name: str = 
     override = _quiet(get_cdp_override, "")
     if override:
         _set_cdp_env(env, override)
+        _remember_route_session(env, {"cdp_url": override, "features": {"cdp_override": True}})
         return None
     if force_local_sidecar:
         return _resolve_local_cdp(env, task_id, session_name, sidecar=True)
@@ -459,6 +479,8 @@ def _resolve_backend_cdp(env: dict, task_id: Optional[str], session_name: str = 
         f"Cloud browser provider {provider_name} returned no CDP endpoint, so browser_exec "
         "cannot drive it. Pick a CDP-capable provider via `hermes tools` → Browser Automation.",
     )
+    if err is None:
+        _remember_route_session(env, session)
     if session.get("fallback_from_cloud"):
         # The provider failed (rate limit, quota, outage) and the session layer fell back to a LOCAL
         # browser for this key; it already carries its CDP URL.
@@ -499,6 +521,11 @@ def _resolve_real_profile_cdp(env: dict, force_local: bool) -> Optional[str]:
     cdp, err = real_profile_cdp()
     if cdp and not err:
         _set_cdp_env(env, cdp)
+        _remember_route_session(env, {
+            "cdp_url": cdp,
+            "features": {"local": True, "real_profile": True},
+            "shared_profile": True,
+        })
         env[_BOT_DESKTOP_BROWSER_SENTINEL] = "local"  # the user's real Chromium, whatever browser.engine says
     return err or None
 
@@ -621,6 +648,10 @@ _live_generation = functools.partial(_lazy_call, "tools.browser_session_cdp", "l
                                      "live CDP generation lookup failed")  # this profile's publish count
 # Route cache key -> whether its last browser_exec ran on the hybrid local sidecar.
 _exec_route_is_sidecar: dict[str, bool] = {}
+# Route cache key -> (owning profile, live CDP generation, exact endpoint/provenance) last selected for
+# its persistent harness daemon. Vault attaches to this same browser instead of independently reconstructing
+# the route; the generation prevents a late old-route insertion from surviving /browser connect.
+_exec_resolved_routes: dict[str, tuple[str, int, BrowserExecRoute]] = {}
 # Route cache key -> the note from its real-profile fallback; that route stays on the fallback browser.
 _real_profile_fallback: dict[str, str] = {}
 _real_profile_note_delivered: set = set()
@@ -634,6 +665,10 @@ def stop_harness_daemons(home_key: Optional[str] = None) -> None:
         daemons = sorted(key for key, home in _driven_daemons.items() if home_key in (None, home))
         for key in daemons:
             _driven_daemons.pop(key, None)
+        stale_routes = [key for key, (home, _generation, _route) in _exec_resolved_routes.items()
+                        if home_key in (None, home)]
+        for key in stale_routes:
+            _exec_resolved_routes.pop(key, None)
     _reload_daemons(daemons)
 
 
@@ -753,6 +788,67 @@ def _route_exec_current(env: dict, session: str, task_id: Optional[str], local: 
     return routed, route_err, sidecar, generation
 
 
+def _route_from_env(env: dict) -> BrowserExecRoute:
+    """Pop browser_exec's in-process route provenance from a fully resolved environment."""
+    cdp_url = str(env.get("BU_CDP_WS") or env.get("BU_CDP_URL") or "")
+    session = dict(env.pop(_ROUTE_SESSION_SENTINEL, {}) or {})
+    if not session:
+        session = {"cdp_url": cdp_url, "features": {}}
+    else:
+        session.setdefault("cdp_url", cdp_url)
+    return BrowserExecRoute(cdp_url=cdp_url, session=session)
+
+
+def _remember_exec_route(route_key: str, route: BrowserExecRoute, generation: int) -> Optional[BrowserExecRoute]:
+    """Cache ``route`` only while the generation it resolved under is still current."""
+    if _live_generation() != generation:
+        return None
+    entry = (hermes_home_key(), generation, route)
+    _exec_resolved_routes[route_key] = entry
+    if _live_generation() == generation:
+        return route
+    if _exec_resolved_routes.get(route_key) is entry:
+        _exec_resolved_routes.pop(route_key, None)
+    return None
+
+
+def _default_browser_exec_route(task_id: Optional[str]) -> BrowserExecRoute:
+    """Initialize browser_exec's unnamed route and return its exact endpoint and provenance.
+
+    This is the on-demand attach seam for browser_vault: it resolves the same cache key and remembered
+    hybrid-sidecar route as an unnamed browser_exec call, but does not build the credential-bearing harness
+    environment or start a harness subprocess. Direct Browser Use cloud sessions expose no CDP endpoint and
+    deliberately return an empty endpoint so vault secret injection remains supervisor-only.
+    """
+    from tools.browser_session import build_browser_env
+
+    route_key = _backend_cache_key(task_id)
+    remembered = _exec_resolved_routes.get(route_key)
+    if (remembered is not None and remembered[0] == hermes_home_key()
+            and remembered[1] == _live_generation()):
+        return remembered[2]
+    if _exec_resolved_routes.get(route_key) is remembered:
+        _exec_resolved_routes.pop(route_key, None)
+    local_sidecar = _exec_route_is_sidecar.get(route_key, False)
+    for _attempt in range(3):
+        env, route_err, _sidecar, generation = _route_exec_current(
+            build_browser_env(), "", task_id, False, local_sidecar, route_key
+        )
+        if route_err:
+            logger.debug("browser_exec default-session routing unavailable for vault attach: %s", route_err)
+            return BrowserExecRoute(cdp_url="", session={})
+        route = _remember_exec_route(route_key, _route_from_env(env), generation)
+        if route is not None:
+            return route
+    logger.debug("browser_exec default-session route changed repeatedly during vault attach")
+    return BrowserExecRoute(cdp_url="", session={})
+
+
+def _default_browser_exec_cdp(task_id: Optional[str]) -> str:
+    """Compatibility seam for callers that only need the unnamed route's endpoint."""
+    return _default_browser_exec_route(task_id).cdp_url
+
+
 def _reload_if_republished(env: dict, generation: int) -> None:
     """Stop this call's daemon if the profile published a new endpoint while it spawned on the old one."""
     if _live_generation() == generation:
@@ -804,6 +900,7 @@ def browser_exec(code: str, session: str = "", timeout_s: int = _DEFAULT_TIMEOUT
         env, session, task_id, bool(local), local_sidecar, route_key)
     if route_err:
         return tool_error(route_err)
+    _remember_exec_route(route_key, _route_from_env(env), generation)
     if local_sidecar:
         env["BU_NAME"] = _sidecar_daemon_name(session)
     fit_default_socket_dir(env)  # BU_NAME is final: a deep HOME's socket would overflow sun_path

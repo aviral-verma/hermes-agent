@@ -35,10 +35,22 @@ import os
 import shutil
 import subprocess
 import tempfile
+import threading
 import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 import pytest
+
+
+_MAC_CHROME = Path("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome")
+
+
+def _installed_chrome() -> str | None:
+    for candidate in ("google-chrome", "chromium", "chromium-browser"):
+        if path := shutil.which(candidate):
+            return path
+    return str(_MAC_CHROME) if _MAC_CHROME.is_file() else None
 
 
 pytestmark = [
@@ -48,17 +60,15 @@ pytestmark = [
         reason="real-browser E2E: set HERMES_E2E_BROWSER=1 to opt in",
     ),
     pytest.mark.skipif(
-        not shutil.which("google-chrome") and not shutil.which("chromium"),
+        not _installed_chrome(),
         reason="Chrome/Chromium not installed",
     ),
 ]
 
 
 def _find_chrome() -> str:
-    for candidate in ("google-chrome", "chromium", "chromium-browser"):
-        path = shutil.which(candidate)
-        if path:
-            return path
+    if path := _installed_chrome():
+        return path
     pytest.skip("no Chrome binary found")
 
 
@@ -162,7 +172,7 @@ def _test_page_url() -> str:
     return "data:text/html;base64," + base64.b64encode(html.encode()).decode()
 
 
-def _fire_on_page(cdp_url: str, expression: str) -> None:
+def _fire_on_page(cdp_url: str, expression: str, page_url: str | None = None) -> None:
     """Navigate the first page target to a data URL and fire `expression`."""
     import websockets as _ws_mod
 
@@ -190,7 +200,7 @@ def _fire_on_page(cdp_url: str, expression: str) -> None:
                 "Target.attachToTarget", {"targetId": page["targetId"], "flatten": True}
             )
             sid = attach["result"]["sessionId"]
-            await call("Page.navigate", {"url": _test_page_url()}, session_id=sid)
+            await call("Page.navigate", {"url": page_url or _test_page_url()}, session_id=sid)
             await asyncio.sleep(1.5)  # let the page load
             await call(
                 "Runtime.evaluate",
@@ -199,6 +209,83 @@ def _fire_on_page(cdp_url: str, expression: str) -> None:
             )
 
     asyncio.run(run())
+
+
+def _create_loaded_target(cdp_url: str, url: str) -> None:
+    """Create another synthetic tab and wait for its load event without touching a user browser."""
+    import websockets as _ws_mod
+
+    async def run():
+        async with _ws_mod.connect(cdp_url, max_size=50 * 1024 * 1024) as ws:
+            next_id = 1
+
+            async def call(method, params=None, session_id=None, events=None):
+                nonlocal next_id
+                cid = next_id
+                next_id += 1
+                payload = {"id": cid, "method": method}
+                if params:
+                    payload["params"] = params
+                if session_id:
+                    payload["sessionId"] = session_id
+                await ws.send(json.dumps(payload))
+                async for raw in ws:
+                    message = json.loads(raw)
+                    if message.get("id") == cid:
+                        return message
+                    if events is not None:
+                        events.append(message)
+
+            created = await call("Target.createTarget", {"url": "about:blank"})
+            attached = await call("Target.attachToTarget", {
+                "targetId": created["result"]["targetId"],
+                "flatten": True,
+            })
+            sid = attached["result"]["sessionId"]
+            events = []
+            await call("Page.enable", session_id=sid, events=events)
+            await call("Page.navigate", {"url": url}, session_id=sid, events=events)
+            if any(message.get("sessionId") == sid and message.get("method") == "Page.loadEventFired"
+                   for message in events):
+                return
+            async for raw in ws:
+                message = json.loads(raw)
+                if message.get("sessionId") == sid and message.get("method") == "Page.loadEventFired":
+                    return
+
+    asyncio.run(run())
+
+
+@pytest.fixture
+def synthetic_vault_sites():
+    """Two loopback HTTP origins serving only in-memory dummy form fixtures."""
+    pages: dict[str, str] = {}
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            body = pages.get(self.path, "<h1>not found</h1>").encode()
+            self.send_response(200 if self.path in pages else 404)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, message, *args):
+            return
+
+    servers = [ThreadingHTTPServer(("127.0.0.1", 0), Handler) for _ in range(2)]
+    threads = [threading.Thread(target=server.serve_forever, daemon=True) for server in servers]
+    for thread in threads:
+        thread.start()
+    bases = [f"http://127.0.0.1:{server.server_port}" for server in servers]
+    try:
+        yield bases[0], bases[1], pages
+    finally:
+        for server in servers:
+            server.shutdown()
+            server.server_close()
+        for thread in threads:
+            thread.join(timeout=2)
 
 
 @pytest.fixture
@@ -322,3 +409,156 @@ def test_evaluate_runtime_unserializable_value(chrome_cdp, supervisor_registry):
     out = supervisor.evaluate_runtime("Infinity")
     assert out["ok"] is True
     assert out["result"] == "Infinity"
+
+
+def _evaluated_json(supervisor, expression: str):
+    result = supervisor.evaluate_runtime(expression)
+    assert result["ok"] is True, result
+    value = result["result"]
+    return json.loads(value) if isinstance(value, str) else value
+
+
+def test_vault_fill_keeps_top_level_behavior(chrome_cdp, supervisor_registry, synthetic_vault_sites):
+    from agent.vault_login_classifier import build_fill_js, build_inspection_js
+
+    base, _, pages = synthetic_vault_sites
+    pages["/top"] = ('<input id="password" type="password" autocomplete="current-password">'
+                     '<iframe id="unused" src="/unused"></iframe>')
+    pages["/unused"] = '<input id="unused-password" type="password" autocomplete="current-password">'
+    cdp_url, _ = chrome_cdp
+    supervisor = supervisor_registry.get_or_start(task_id="vault-top", cdp_url=cdp_url)
+    _fire_on_page(cdp_url, "void 0", f"{base}/top")
+
+    controls = _evaluated_json(supervisor, build_inspection_js("top-nonce"))
+    assert len(controls) == 2 and controls[0]["framePath"] == []
+    filled = _evaluated_json(supervisor, build_fill_js([{
+        "index": controls[0]["index"],
+        "token": "current-password",
+        "value": "dummy-top-password",
+    }], expected_origin=base, nonce="top-nonce"))
+
+    assert filled == {"filled": 1}
+    assert supervisor.evaluate_runtime("document.querySelector('#password').value")["result"] == "dummy-top-password"
+    markers = ("document.querySelectorAll('[data-hermes-vault-slot], [data-hermes-vault-frame]').length + "
+               "document.querySelector('#unused').contentDocument"
+               ".querySelectorAll('[data-hermes-vault-slot], [data-hermes-vault-frame]').length")
+    assert supervisor.evaluate_runtime(markers)["result"] == 0
+
+
+def test_vault_fill_reaches_nested_iframe_inside_shadow_root(
+    chrome_cdp, supervisor_registry, synthetic_vault_sites
+):
+    from agent.vault_login_classifier import build_fill_js, build_inspection_js
+
+    base, _, pages = synthetic_vault_sites
+    pages["/nested"] = """<div id="host"></div><script>
+      const frame = document.createElement('iframe'); frame.src = '/middle';
+      document.querySelector('#host').attachShadow({mode: 'open'}).append(frame);
+    </script>"""
+    pages["/middle"] = ('<iframe id="inner" srcdoc="&lt;input id=&quot;password&quot; type=&quot;password&quot; '
+                        'autocomplete=&quot;current-password&quot;&gt;"></iframe>')
+    cdp_url, _ = chrome_cdp
+    supervisor = supervisor_registry.get_or_start(task_id="vault-nested", cdp_url=cdp_url)
+    _fire_on_page(cdp_url, "void 0", f"{base}/nested")
+
+    controls = _evaluated_json(supervisor, build_inspection_js("nested-nonce"))
+    assert len(controls) == 1 and len(controls[0]["framePath"]) == 2
+    filled = _evaluated_json(supervisor, build_fill_js([{
+        "index": controls[0]["index"],
+        "token": "current-password",
+        "value": "dummy-nested-password",
+        "frame_path": tuple(controls[0]["framePath"]),
+    }], expected_origin=base, nonce="nested-nonce"))
+
+    assert filled == {"filled": 1}
+    read_value = "document.querySelector('#host').shadowRoot.querySelector('iframe').contentDocument" \
+                 ".querySelector('#inner').contentDocument.querySelector('#password').value"
+    assert supervisor.evaluate_runtime(read_value)["result"] == "dummy-nested-password"
+    marker_count = ("document.querySelectorAll('[data-hermes-vault-slot], [data-hermes-vault-frame]').length + "
+                    "document.querySelector('#host').shadowRoot"
+                    ".querySelectorAll('[data-hermes-vault-slot], [data-hermes-vault-frame]').length + "
+                    "document.querySelector('#host').shadowRoot.querySelector('iframe').contentDocument"
+                    ".querySelectorAll('[data-hermes-vault-slot], [data-hermes-vault-frame]').length + "
+                    "document.querySelector('#host').shadowRoot.querySelector('iframe').contentDocument"
+                    ".querySelector('#inner').contentDocument"
+                    ".querySelectorAll('[data-hermes-vault-slot], [data-hermes-vault-frame]').length")
+    assert supervisor.evaluate_runtime(marker_count)["result"] == 0
+
+
+def test_vault_probe_selects_the_same_origin_iframe_tab(
+    chrome_cdp, supervisor_registry, synthetic_vault_sites
+):
+    from tools import browser_vault_tool
+    from tools.browser_use_cli import BrowserExecRoute
+
+    base, _, pages = synthetic_vault_sites
+    pages["/plain"] = "<h1>No login here</h1>"
+    pages["/framed"] = '<iframe src="/password"></iframe>'
+    pages["/password"] = '<input type="password" autocomplete="current-password">'
+    cdp_url, _ = chrome_cdp
+    supervisor = supervisor_registry.get_or_start(task_id="vault-tabs", cdp_url=cdp_url)
+    _fire_on_page(cdp_url, "void 0", f"{base}/plain")
+    _create_loaded_target(cdp_url, f"{base}/framed")
+
+    route = BrowserExecRoute(cdp_url=cdp_url, session={"cdp_url": cdp_url, "features": {}})
+    token = browser_vault_tool._browser_exec_route.set(route)
+    try:
+        assert browser_vault_tool._focus_bound_origin("vault-tabs", base, "login") == base
+        assert supervisor.evaluate_runtime("window.location.pathname")["result"] == "/framed"
+    finally:
+        browser_vault_tool._browser_exec_route.reset(token)
+
+
+def test_vault_skips_cross_origin_opaque_and_unsafe_sandbox_frames(
+    chrome_cdp, supervisor_registry, synthetic_vault_sites
+):
+    from agent.vault_login_classifier import build_inspection_js
+    from tools.browser_vault_tool import _TAB_PROBES
+
+    base, other, pages = synthetic_vault_sites
+    opaque = base64.b64encode(b'<input type="password" autocomplete="current-password">').decode()
+    pages["/blocked"] = f"""
+      <iframe src="{other}/password"></iframe>
+      <iframe src="data:text/html;base64,{opaque}"></iframe>
+      <iframe sandbox src="/password"></iframe>
+    """
+    pages["/password"] = '<input type="password" autocomplete="current-password">'
+    cdp_url, _ = chrome_cdp
+    supervisor = supervisor_registry.get_or_start(task_id="vault-blocked", cdp_url=cdp_url)
+    _fire_on_page(cdp_url, "void 0", f"{base}/blocked")
+
+    assert _evaluated_json(supervisor, build_inspection_js("blocked-nonce")) == []
+    probe = supervisor.evaluate_runtime(_TAB_PROBES["login"])
+    assert probe["ok"] is True and probe["result"] is False
+
+
+def test_vault_refuses_when_the_destination_frame_changes_origin(
+    chrome_cdp, supervisor_registry, synthetic_vault_sites
+):
+    from agent.vault_login_classifier import build_fill_js, build_inspection_js
+
+    base, other, pages = synthetic_vault_sites
+    pages["/change"] = '<iframe id="destination" src="/password"></iframe>'
+    pages["/password"] = '<input type="password" autocomplete="current-password">'
+    cdp_url, _ = chrome_cdp
+    supervisor = supervisor_registry.get_or_start(task_id="vault-change", cdp_url=cdp_url)
+    _fire_on_page(cdp_url, "void 0", f"{base}/change")
+    [control] = _evaluated_json(supervisor, build_inspection_js("change-nonce"))
+
+    navigated = supervisor.evaluate_runtime(
+        "new Promise((resolve) => { const frame = document.querySelector('#destination'); "
+        f"frame.onload = () => resolve(true); frame.src = {json.dumps(other + '/password')}; }})"
+    )
+    assert navigated["ok"] is True and navigated["result"] is True
+    refused = _evaluated_json(supervisor, build_fill_js([{
+        "index": control["index"],
+        "token": "current-password",
+        "value": "dummy-refused-password",
+        "frame_path": tuple(control["framePath"]),
+    }], expected_origin=base, nonce="change-nonce"))
+
+    assert refused["refused"] == "origin_changed"
+    assert refused["found"] in {"cross-origin", "unavailable"}
+    assert supervisor.evaluate_runtime(
+        "document.querySelectorAll('[data-hermes-vault-slot], [data-hermes-vault-frame]').length"
+    )["result"] == 0

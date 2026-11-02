@@ -162,6 +162,29 @@ class TestToolSurfaceSwap:
 
 
 class TestVaultSupervisorAttach:
+    def test_vault_attach_initializes_default_browser_exec_route_without_harness_env(
+        self, monkeypatch, _fake_managed_chromium, _fake_supervisor_registry
+    ):
+        """Vault's on-demand attach gets browser_exec's unnamed browser without building the secret-bearing
+        harness environment or spawning its CLI."""
+        from tools import browser_vault_tool
+
+        monkeypatch.setattr(bs, "build_browser_env", dict)
+        monkeypatch.setattr(bs, "session_for_task", lambda _task_id: {})
+        monkeypatch.setattr(bu_cli, "_base_subprocess_env", lambda: pytest.fail("harness env must not be built"))
+        monkeypatch.setattr(bu_cli, "_find_cli", lambda: pytest.fail("harness CLI must not be resolved"))
+        monkeypatch.setattr("tools.browser_session_cdp.get_cdp_override", lambda: "")
+        monkeypatch.setattr("tools.browser_session_cdp.get_dialog_policy_config", lambda: ("dismiss", 1.0))
+        monkeypatch.setattr(bs_cloud, "get_cloud_provider", lambda: None)
+        monkeypatch.setattr(bu_cli, "_real_profile_consented", lambda: False)
+
+        browser_vault_tool._ensure_supervisor("t-vault-on-demand")
+
+        assert _fake_managed_chromium == ["t-vault-on-demand"]
+        assert _fake_supervisor_registry == [
+            ("t-vault-on-demand", "ws://127.0.0.1:47000/devtools/browser/t-vault-on-demand")
+        ]
+
     def test_exec_attaches_supervisor_to_the_browser_it_drives(self, tmp_path, monkeypatch, _fake_supervisor_registry):
         """browser_vault_fill injects secrets only over the supervisor's CDP WebSocket. Without this attach the
         default (Browser Use) backend had no supervisor at all and every fill failed with supervisor_required."""

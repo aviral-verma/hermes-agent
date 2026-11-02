@@ -13,6 +13,7 @@ State lives here; sibling modules (``browser_session_*``) late-import this modul
 from __future__ import annotations
 
 import atexit
+import contextvars
 import logging
 import threading
 import uuid
@@ -39,6 +40,10 @@ BROWSER_SESSION_INACTIVITY_TIMEOUT = _get_session_inactivity_timeout()
 # Orphan reap cadence: a startup-only reap never recovers a leak that appears in a long-lived process.
 BROWSER_ORPHAN_REAP_INTERVAL = 300
 MAX_INACTIVITY_CLEANUP_FAILURES = 3
+
+_fence_admission_epoch: contextvars.ContextVar[Optional[int]] = contextvars.ContextVar(
+    "browser_fence_admission_epoch", default=None
+)
 
 _active_sessions: dict[str, dict[str, Any]] = {}
 _session_last_activity: dict[str, float] = {}
@@ -106,12 +111,22 @@ def run_fenced(session_info: dict[str, Any], fn: Callable[[], dict[str, Any]]) -
         admitted = _bd_lease.assert_agent_may_act()
     except _bd_lease.HumanHasControl as e:
         return {"success": False, "error": str(e), "code": "human_has_control"}
-    result = fn()
-    if _bd_lease.get().epoch != admitted.epoch:
+    expected_epoch = _fence_admission_epoch.get()
+    if expected_epoch is not None and admitted.epoch != expected_epoch:
         return {"success": False, "code": "human_has_control",
                 "error": "A human took over the bot's screen while this browser command ran; its result was "
                          "discarded. Tell the user what you need; retry once they hand back."}
-    return result
+    token = _fence_admission_epoch.set(admitted.epoch) if expected_epoch is None else None
+    try:
+        result = fn()
+        if _bd_lease.get().epoch != admitted.epoch:
+            return {"success": False, "code": "human_has_control",
+                    "error": "A human took over the bot's screen while this browser command ran; its result was "
+                             "discarded. Tell the user what you need; retry once they hand back."}
+        return result
+    finally:
+        if token is not None:
+            _fence_admission_epoch.reset(token)
 
 
 def ensure_screen_for_headed_chromium() -> None:
