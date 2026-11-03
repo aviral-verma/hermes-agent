@@ -30,7 +30,7 @@ class FakePage(BrowserPageBackend):
         self.calls.append((expression, secret))
         if secret and self.fail_secret:
             raise RuntimeError(f"page.evaluate failed: {expression}")
-        if "location.href" in expression:
+        if expression.strip() == "window.location.href":
             return self.url
         if SECRET in expression:
             return json.dumps({"filled": 1})

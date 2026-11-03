@@ -176,10 +176,7 @@ def _eval_js_secret(task_id: str, expression: str) -> dict[str, Any]:
         page = _page_backend(task_id)
         supervisor = None
         if page is None:
-            try:
-                supervisor = _ensure_supervisor(task_id)
-            except Exception as exc:
-                logger.debug("vault fill: supervisor unavailable (%s)", exc)
+            supervisor = _ensure_supervisor(task_id)
 
         if page is None and supervisor is None:
             return {
@@ -281,10 +278,7 @@ def _focus_bound_origin(task_id: str, origin: str, kind: str) -> Optional[str]:
     def focus() -> dict[str, Any]:
         if _page_backend(task_id) is not None:
             return {"ok": False}
-        try:
-            supervisor = _ensure_supervisor(task_id)
-        except Exception:
-            supervisor = None
+        supervisor = _ensure_supervisor(task_id)
         if supervisor is None:
             return {"ok": False}
         return supervisor.focus_page(origin, accept=_TAB_PROBES.get(kind))
@@ -385,7 +379,7 @@ def browser_vault_unlock(backend_name: str) -> str:
                            "error": f"The user declined to unlock {backend.display_name}."})
     try:
         unlocked = _fenced_vault_side_effect(
-            "default", lambda: backend.unlock(master)  # type: ignore[attr-defined]
+            "default", lambda value=master: backend.unlock(value)  # type: ignore[attr-defined]
         )
         if not unlocked.get("success"):
             return json.dumps(unlocked)

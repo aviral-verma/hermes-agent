@@ -56,7 +56,7 @@ class _FakePage:
     def evaluate_runtime(self, expression: str) -> dict:
         if expression.strip() == "window.location.href":
             return {"ok": True, "result": self.href}
-        if "expectedOrigin" in expression:  # the fill script (build_fill_js)
+        if "const fills =" in expression:  # the fill script (build_fill_js)
             self.writes.append(expression)
             return {"ok": True, "result": json.dumps({"filled": 1})}
         return {"ok": True, "result": json.dumps(self.controls)}  # input inspection

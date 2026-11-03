@@ -34,6 +34,7 @@ import json
 import os
 import shutil
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -50,6 +51,21 @@ def _installed_chrome() -> str | None:
     for candidate in ("google-chrome", "chromium", "chromium-browser"):
         if path := shutil.which(candidate):
             return path
+    # scripts/run_tests.sh deliberately supplies an isolated HOME. On macOS,
+    # also discover Playwright's pinned Chromium under the account's real cache;
+    # unlike the system Chrome singleton this always honors our disposable profile.
+    if sys.platform == "darwin":
+        import pwd
+
+        account_home = Path(pwd.getpwuid(os.getuid()).pw_dir)
+        playwright = sorted(
+            account_home.glob(
+                "Library/Caches/ms-playwright/chromium-*/chrome-mac/Chromium.app/Contents/MacOS/Chromium"
+            ),
+            reverse=True,
+        )
+        if playwright:
+            return str(playwright[0])
     return str(_MAC_CHROME) if _MAC_CHROME.is_file() else None
 
 
@@ -84,19 +100,40 @@ def chrome_cdp(tmp_path):
     """
     profile = tempfile.mkdtemp(prefix="hermes-supervisor-test-")
     stderr = (tmp_path / "chrome.stderr").open("w+b")
+    chrome = _find_chrome()
+    browser_flags = ["--headless=new", "--disable-extensions"]
+    launch_env = os.environ.copy()
+    if "ms-playwright" in chrome and sys.platform == "darwin":
+        import pwd
+
+        # The pinned macOS Chromium stalls before opening CDP when HOME points
+        # at run_tests.sh's synthetic home. Its profile and password store remain
+        # disposable; HOME is restored only for framework startup resources.
+        launch_env["HOME"] = pwd.getpwuid(os.getuid()).pw_dir
+        browser_flags = [
+            "--headless",
+            "--no-sandbox",
+            "--disable-dev-shm-usage",
+            "--disable-background-networking",
+            "--disable-component-update",
+            "--password-store=basic",
+            "--use-mock-keychain",
+            "--disable-extensions",
+        ]
     proc = subprocess.Popen(
         [
-            _find_chrome(),
+            chrome,
             "--remote-debugging-port=0",
             f"--user-data-dir={profile}",
             "--no-first-run",
             "--no-default-browser-check",
-            "--headless=new",
+            *browser_flags,
             "--disable-gpu",
             "--site-per-process",  # force OOPIFs for cross-origin iframes
         ],
         stdout=subprocess.DEVNULL,
         stderr=stderr,
+        env=launch_env,
     )
 
     ws_url = None
